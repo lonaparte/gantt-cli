@@ -9,13 +9,13 @@ use ratatui::{
     widgets::{block::*, *},
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::fs;
-use std::io::{self, stdout};
+use std::fs::{self, OpenOptions};
+use std::io::{self, stdout, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_width::UnicodeWidthStr;
 
 // --- DATA STRUCTURES ---
@@ -142,6 +142,7 @@ struct AllProjectsData {
 #[derive(Clone)]
 struct HistoryState {
     all_projects: AllProjectsData,
+    deleted_projects: Vec<ProjectData>,
 }
 
 // --- APPLICATION STATE ---
@@ -213,7 +214,7 @@ struct App {
     todo_subtask_index: Option<usize>,
     column_config_open: bool,
     column_config_selected: usize,
-    file_mtime: Option<SystemTime>,
+    file_snapshot: Option<Vec<u8>>,
     save_conflict_pending: bool,
 }
 
@@ -247,11 +248,8 @@ fn get_default_data_path() -> PathBuf {
 }
 
 impl App {
-    fn new() -> Self {
-        let data_path = get_default_data_path();
-        let file_path_str = data_path.to_string_lossy().to_string();
-
-        let mut app = App {
+    fn empty(data_path: PathBuf) -> Self {
+        Self {
             all_projects: AllProjectsData {
                 projects: vec![],
                 active_project_index: 0,
@@ -275,7 +273,7 @@ impl App {
             gantt_area_width: 0,
             history: vec![],
             redo_history: vec![],
-            current_file_path: file_path_str.clone(),
+            current_file_path: data_path.to_string_lossy().into_owned(),
             todo_list_open: false,
             highlight_mode: HighlightMode::Today,
             is_dirty: false,
@@ -288,56 +286,50 @@ impl App {
             todo_subtask_index: None,
             column_config_open: false,
             column_config_selected: 0,
-            file_mtime: None,
+            file_snapshot: None,
             save_conflict_pending: false,
-        };
-
-        let load_result = app.load_all_projects();
-        if load_result.is_err() {
-            // Ensure directory exists
-            if let Some(parent) = data_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-
-            app.add_default_project();
-            
-            // Create the file immediately
-            if let Err(e) = app.save_all_projects() {
-                app.status_message = format!("Failed to create data file at {}: {}", file_path_str, e);
-            } else {
-                app.status_message = format!("Welcome! New database created at {}.", file_path_str);
-            }
-        } else {
-            let msg = format!("Projects loaded successfully from {}.", app.current_file_path);
-            app.status_message = msg;
         }
+    }
 
+    fn new() -> io::Result<Self> {
+        Self::from_path(get_default_data_path())
+    }
+
+    fn from_path(data_path: PathBuf) -> io::Result<Self> {
+        let mut app = Self::empty(data_path.clone());
+        match app.load_all_projects() {
+            Ok(()) => app.status_message = format!("Projects loaded from {}.", app.current_file_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = data_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                app.add_default_project();
+                app.all_projects.ntfy_topic = Some(format!("gantt-cli-{}", Local::now().timestamp() % 1000000));
+                app.save_all_projects()?;
+            }
+            Err(error) => return Err(io::Error::new(error.kind(), format!(
+                "Cannot load {}: {}. The existing file has been left unchanged.", app.current_file_path, error))),
+        }
         if app.all_projects.ntfy_topic.is_none() {
             app.all_projects.ntfy_topic = Some(format!("gantt-cli-{}", Local::now().timestamp() % 1000000));
         }
-        
-        if !app.get_current_project().tasks.is_empty() {
-            app.table_state.select(Some(0));
-            app.focus_area = FocusArea::Tasks;
-        } else {
-            app.focus_area = FocusArea::Project(ProjectField::Name);
-        }
-
+        if !app.get_current_project().tasks.is_empty() { app.table_state.select(Some(0)); }
+        else { app.focus_area = FocusArea::Project(ProjectField::Name); }
         app.recalculate_schedule();
-        app
+        Ok(app)
     }
 
     fn add_default_project(&mut self) {
         let mut default_project = ProjectData {
             project_name: "New Project".to_string(),
-            project_start_date: NaiveDate::from_ymd_opt(2024, 8, 1).unwrap(),
+            project_start_date: self.today,
             project_end_date: None,
             day_offset: 0,
             tasks: vec![],
             archived: false,
         };
-        default_project.tasks.push(Task { id: 0, name: "Requirement Gathering".into(), assigned_to: "Alice".into(), duration: 5, progress: 100, dependencies: vec![], manual_start_date: None, parent_id: None, start_date: None, end_date: None });
-        default_project.tasks.push(Task { id: 0, name: "UI/UX Design".into(), assigned_to: "Bob".into(), duration: 7, progress: 50, dependencies: vec![1], manual_start_date: None, parent_id: None, start_date: None, end_date: None });
+        default_project.tasks.push(Task { id: 1, name: "Requirement Gathering".into(), assigned_to: "Alice".into(), duration: 5, progress: 100, dependencies: vec![], manual_start_date: None, parent_id: None, start_date: None, end_date: None });
+        default_project.tasks.push(Task { id: 2, name: "UI/UX Design".into(), assigned_to: "Bob".into(), duration: 7, progress: 50, dependencies: vec![1], manual_start_date: None, parent_id: None, start_date: None, end_date: None });
         
         self.all_projects.projects.push(default_project);
         self.current_project_index = self.all_projects.projects.len() - 1;
@@ -347,7 +339,10 @@ impl App {
     }
 
     fn add_new_project(&mut self) {
-        self.save_all_projects().unwrap_or_else(|_| self.status_message = "Failed to save current project before creating new one.".into());
+        if let Err(error) = self.save_all_projects() {
+            self.status_message = format!("Project not created: {}", error);
+            return;
+        }
         let new_project_name = format!("New Project {}", self.all_projects.projects.len() + 1);
         let new_project = ProjectData {
             project_name: new_project_name.clone(),
@@ -387,14 +382,13 @@ impl App {
     }
 
     fn restore_deleted_project(&mut self) {
-        if let Some(project) = self.deleted_projects.pop() {
+        if !self.deleted_projects.is_empty() {
+            self.save_state_for_undo();
+            let project = self.deleted_projects.pop().unwrap();
             self.all_projects.projects.push(project.clone());
             self.current_project_index = self.all_projects.projects.len() - 1;
             
-            self.history.clear();
-            self.redo_history.clear();
             self.recalculate_schedule();
-            
             self.status_message = format!("Restored project '{}'.", project.project_name);
             self.is_dirty = true;
         } else {
@@ -405,6 +399,7 @@ impl App {
     fn archive_current_project(&mut self) {
         let was_archived = self.get_current_project().archived;
         let project_name = self.get_current_project().project_name.clone();
+        self.save_state_for_undo();
         self.get_current_project_mut().archived = !was_archived;
         self.is_dirty = true;
 
@@ -647,119 +642,114 @@ impl App {
     }
 
     fn remap_ids_and_dependencies(&mut self) {
-        let current_project = self.get_current_project_mut();
-        let id_map: HashMap<u32, u32> = current_project.tasks
-            .iter()
-            .enumerate()
-            .map(|(i, task)| (task.id, (i + 1) as u32))
-            .collect();
-
-        let mut new_tasks = Vec::new();
-        for (i, old_task) in current_project.tasks.iter().enumerate() {
-                    let mut new_task = old_task.clone();
-                    new_task.id = (i + 1) as u32;
-                    
-                    new_task.parent_id = old_task.parent_id
-                        .and_then(|old_parent_id| id_map.get(&old_parent_id).cloned());
-            
-                    new_task.dependencies = old_task.dependencies
-                        .iter()
-                        .filter_map(|old_dep_id| id_map.get(old_dep_id).cloned())
-                        .collect();
-                        
-                    new_tasks.push(new_task);        }
-
-        current_project.tasks = new_tasks;
+        renumber_tasks(self.get_current_project_mut());
         self.recalculate_schedule();
     }
 
     fn recalculate_schedule(&mut self) {
-        let next_id = self.get_current_project().tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-        self.next_task_id = next_id;
-
-        compute_dates_for_project(self.get_current_project_mut());
-
-        // Update parent task durations to span their children
-        let current_project = self.get_current_project_mut();
-        let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for task in &current_project.tasks {
-            if let Some(pid) = task.parent_id {
-                children_map.entry(pid).or_default().push(task.id);
-            }
+        self.next_task_id = self.get_current_project().tasks.iter().map(|t| t.id).max().unwrap_or(0).saturating_add(1);
+        if !compute_dates_for_project(self.get_current_project_mut()) {
+            self.status_message = "Some tasks could not be scheduled: check dependency cycles and date ranges.".to_string();
         }
-        let parent_ids: Vec<u32> = children_map.keys().copied().collect();
-        for pid in parent_ids {
-            if let Some(child_ids) = children_map.get(&pid) {
-                let starts: Vec<NaiveDate> = child_ids.iter()
-                    .filter_map(|id| current_project.tasks.iter().find(|t| t.id == *id))
-                    .filter_map(|t| t.start_date)
-                    .collect();
-                let ends: Vec<NaiveDate> = child_ids.iter()
-                    .filter_map(|id| current_project.tasks.iter().find(|t| t.id == *id))
-                    .filter_map(|t| t.end_date)
-                    .collect();
-                if !starts.is_empty() && !ends.is_empty() {
-                    let min_start = starts.into_iter().min().unwrap();
-                    let max_end = ends.into_iter().max().unwrap();
-                    if let Some(parent) = current_project.tasks.iter_mut().find(|t| t.id == pid) {
-                        parent.duration = (max_end - min_start).num_days() + 1;
-                    }
-                }
-            }
-        }
-
-        let has_cycle = current_project.tasks.iter()
-            .filter(|t| !t.dependencies.is_empty())
-            .any(|t| t.start_date.is_none());
-        if has_cycle {
-            self.status_message = "Warning: circular dependency detected — some tasks could not be scheduled.".to_string();
-        }
+        self.normalize_selection();
     }
 
-    fn save_all_projects(&mut self) -> io::Result<()> {
+    fn normalize_selection(&mut self) {
+        let count = self.get_current_project().tasks.len();
+        if count == 0 {
+            self.table_state.select(None);
+            if self.focus_area == FocusArea::Tasks {
+                self.focus_area = FocusArea::Project(ProjectField::Name);
+                self.input_mode = InputMode::Normal;
+            }
+        } else if let Some(index) = self.table_state.selected() {
+            self.table_state.select(Some(index.min(count - 1)));
+        } else if self.focus_area == FocusArea::Tasks { self.table_state.select(Some(0)); }
+        let todo_count = self.all_projects.todo_list.len();
+        if todo_count == 0 {
+            self.todo_list_state.select(None);
+            self.todo_subtask_index = None;
+            self.editing_todo_name = false;
+            self.editing_subtask = false;
+        } else if let Some(index) = self.todo_list_state.selected() {
+            let index = index.min(todo_count - 1);
+            self.todo_list_state.select(Some(index));
+            if let Some(sub_index) = self.todo_subtask_index {
+                let len = self.all_projects.todo_list[index].subtasks.len();
+                self.todo_subtask_index = if len == 0 { None } else { Some(sub_index.min(len - 1)) };
+            }
+        }
+        if !task_field_visible(self, self.selected_task_field) { self.selected_task_field = TaskField::Name; }
+    }
+
+    fn save_all_projects(&mut self) -> io::Result<()> { self.save_projects(false) }
+
+    fn save_projects(&mut self, overwrite_conflict: bool) -> io::Result<()> {
+        if !overwrite_conflict && self.file_was_modified_externally()? {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                "The data file changed externally. Use Ctrl+s twice to confirm overwriting it."));
+        }
         self.all_projects.active_project_index = self.current_project_index;
-        let json_data = serde_json::to_string_pretty(&self.all_projects)?;
-        fs::write(&self.current_file_path, json_data)?;
-        self.file_mtime = fs::metadata(&self.current_file_path).and_then(|m| m.modified()).ok();
+        let json_data = serde_json::to_vec_pretty(&self.all_projects)?;
+        let path = Path::new(&self.current_file_path);
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        static SAVE_ID: AtomicU64 = AtomicU64::new(0);
+        let temp_path = parent.join(format!(".projects-{}-{}.tmp", std::process::id(), SAVE_ID.fetch_add(1, Ordering::Relaxed)));
+        let result = (|| -> io::Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)] {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path)?;
+            file.write_all(&json_data)?;
+            file.sync_all()?;
+            drop(file);
+            if !overwrite_conflict && self.file_was_modified_externally()? {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "The data file changed during saving."));
+            }
+            fs::rename(&temp_path, path)?;
+            #[cfg(unix)]
+            if let Ok(directory) = fs::File::open(parent) { let _ = directory.sync_all(); }
+            Ok(())
+        })();
+        if result.is_err() { let _ = fs::remove_file(&temp_path); }
+        result?;
+        self.file_snapshot = Some(json_data);
         self.is_dirty = false;
         self.quit_pending = false;
         self.save_conflict_pending = false;
-
         self.status_message = format!("Saved to {}.", self.current_file_path);
         Ok(())
     }
 
     fn load_all_projects(&mut self) -> io::Result<()> {
-        let path = Path::new(&self.current_file_path);
-        if path.exists() {
-            let json_data = fs::read_to_string(path)?;
-            let all_projects: AllProjectsData = serde_json::from_str(&json_data)?;
-            self.all_projects = all_projects;
-            self.current_project_index = self.all_projects.active_project_index;
-            self.history.clear();
-            self.redo_history.clear();
-            self.file_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
-            Ok(())
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, "File not found"))
-        }
+        let json_data = fs::read(&self.current_file_path)?;
+        let mut all_projects: AllProjectsData = serde_json::from_slice(&json_data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_loaded_data(&mut all_projects)?;
+        self.current_project_index = all_projects.active_project_index;
+        self.all_projects = all_projects;
+        self.history.clear();
+        self.redo_history.clear();
+        self.file_snapshot = Some(json_data);
+        Ok(())
     }
 
-    fn file_was_modified_externally(&self) -> bool {
-        let stored = match self.file_mtime {
-            Some(t) => t,
-            None => return false,
-        };
-        fs::metadata(&self.current_file_path)
-            .and_then(|m| m.modified())
-            .map(|current| current != stored)
-            .unwrap_or(false)
+    fn file_was_modified_externally(&self) -> io::Result<bool> {
+        match fs::read(&self.current_file_path) {
+            Ok(current) => Ok(self.file_snapshot.as_ref() != Some(&current)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(self.file_snapshot.is_some()),
+            Err(error) => Err(error),
+        }
     }
 
     fn save_state_for_undo(&mut self) {
         self.all_projects.active_project_index = self.current_project_index;
         self.history.push(HistoryState {
             all_projects: self.all_projects.clone(),
+            deleted_projects: self.deleted_projects.clone(),
         });
         self.redo_history.clear();
         self.is_dirty = true;
@@ -770,7 +760,9 @@ impl App {
             self.all_projects.active_project_index = self.current_project_index;
             self.redo_history.push(HistoryState {
                 all_projects: self.all_projects.clone(),
+                deleted_projects: self.deleted_projects.clone(),
             });
+            self.deleted_projects = previous_state.deleted_projects;
             self.all_projects = previous_state.all_projects;
             self.current_project_index = self.all_projects.active_project_index;
             self.recalculate_schedule();
@@ -786,7 +778,9 @@ impl App {
             self.all_projects.active_project_index = self.current_project_index;
             self.history.push(HistoryState {
                 all_projects: self.all_projects.clone(),
+                deleted_projects: self.deleted_projects.clone(),
             });
+            self.deleted_projects = next_state.deleted_projects;
             self.all_projects = next_state.all_projects;
             self.current_project_index = self.all_projects.active_project_index;
             self.recalculate_schedule();
@@ -924,7 +918,10 @@ impl App {
             self.status_message = "No other projects to switch to.".to_string();
             return;
         }
-        self.save_all_projects().unwrap_or_else(|_| self.status_message = "Failed to save current project before switching.".into());
+        if let Err(error) = self.save_all_projects() {
+            self.status_message = format!("Project not switched: {}", error);
+            return;
+        }
         self.current_project_index = idx;
         self.status_message = format!("Switched to project: {}", self.get_current_project().project_name);
         self.recalculate_schedule();
@@ -948,7 +945,10 @@ impl App {
             self.status_message = "No other projects to switch to.".to_string();
             return;
         }
-        self.save_all_projects().unwrap_or_else(|_| self.status_message = "Failed to save current project before switching.".into());
+        if let Err(error) = self.save_all_projects() {
+            self.status_message = format!("Project not switched: {}", error);
+            return;
+        }
         self.current_project_index = idx;
         self.status_message = format!("Switched to project: {}", self.get_current_project().project_name);
         self.recalculate_schedule();
@@ -957,6 +957,7 @@ impl App {
 
     fn move_project_forward(&mut self) {
         if self.current_project_index < self.all_projects.projects.len() - 1 {
+            self.save_state_for_undo();
             self.all_projects.projects.swap(self.current_project_index, self.current_project_index + 1);
             self.current_project_index += 1;
             self.status_message = format!("Moved project '{}' forward.", self.get_current_project().project_name);
@@ -966,6 +967,7 @@ impl App {
 
     fn move_project_backward(&mut self) {
         if self.current_project_index > 0 {
+            self.save_state_for_undo();
             self.all_projects.projects.swap(self.current_project_index, self.current_project_index - 1);
             self.current_project_index -= 1;
             self.status_message = format!("Moved project '{}' backward.", self.get_current_project().project_name);
@@ -1018,6 +1020,8 @@ impl App {
                 self.save_state_for_undo();
                 let tasks_mut = &mut self.get_current_project_mut().tasks;
                 tasks_mut[selected_index].parent_id = Some(new_parent_id);
+                reorder_task_tree(self.get_current_project_mut());
+                self.table_state.select(self.get_current_project().tasks.iter().position(|t| t.id == task_id));
                 self.recalculate_schedule();
             }
         }
@@ -1033,6 +1037,7 @@ impl App {
             let selected_task = &current_project.tasks[selected_index];
 
             if let Some(parent_id) = selected_task.parent_id {
+                let task_id = selected_task.id;
                 let parent_task_parent_id = current_project.tasks
                     .iter()
                     .find(|t| t.id == parent_id)
@@ -1042,6 +1047,8 @@ impl App {
                 self.save_state_for_undo();
                 let tasks_mut = &mut self.get_current_project_mut().tasks;
                 tasks_mut[selected_index].parent_id = parent_task_parent_id;
+                reorder_task_tree(self.get_current_project_mut());
+                self.table_state.select(self.get_current_project().tasks.iter().position(|t| t.id == task_id));
                 self.recalculate_schedule();
             }
         }
@@ -1050,7 +1057,7 @@ impl App {
     fn add_new_top_level_task(&mut self) {
         self.save_state_for_undo();
         let new_task = Task {
-            id: 0, // Will be remapped
+            id: self.next_task_id, // Renumbered after insertion
             name: "New Task".into(),
             assigned_to: "Unassigned".into(),
             duration: 1,
@@ -1086,14 +1093,14 @@ impl App {
             } else {
                 None // No parent, so no default start date from parent
             };
-            (selected_task.parent_id, selected_index + 1, parent_start)
+            (selected_task.parent_id, self.get_contiguous_family_range(selected_index).end, parent_start)
         } else {
             // If nothing is selected, add a top-level task at the end
             (None, self.get_current_project().tasks.len(), None)
         };
 
         let new_task = Task {
-            id: 0, // Will be remapped
+            id: self.next_task_id, // Renumbered after insertion
             name: "New Task".into(),
             assigned_to: "Unassigned".into(),
             duration: 1,
@@ -1132,7 +1139,7 @@ impl App {
                     
                     let part = if level % 2 == 1 {
                         // Level 1, 3, 5... use letters
-                        ((b'a' + (siblings_before % 26) as u8) as char).to_string()
+                        alphabetic_id(siblings_before)
                     } else {
                         // Level 2, 4, 6... use numbers
                         (siblings_before + 1).to_string()
@@ -1176,99 +1183,164 @@ impl App {
     }
 }
 
-// --- MARKWHEN EXPORT ---
+// --- DATES AND TASK STRUCTURE ---
 
-fn compute_dates_for_project(project: &mut ProjectData) {
-    let task_map: HashMap<u32, Task> = project.tasks.iter().map(|t| (t.id, t.clone())).collect();
-    let mut calculated: HashMap<u32, Task> = HashMap::new();
-    let mut remaining: Vec<u32> = project.tasks.iter().map(|t| t.id).collect();
+fn add_days(date: NaiveDate, days: i64) -> Option<NaiveDate> {
+    date.checked_add_signed(Duration::try_days(days)?)
+}
 
-    let mut iterations = 0;
-    while !remaining.is_empty() && iterations < 100 {
-        remaining.retain(|task_id| {
-            let task = task_map.get(task_id).unwrap();
-            let deps_ready = task.dependencies.iter()
-                .all(|dep| calculated.contains_key(dep) || !task_map.contains_key(dep));
-            if deps_ready {
-                let mut updated = task.clone();
-                if !task.dependencies.is_empty() {
-                    let max_dep_end = task.dependencies.iter()
-                        .filter_map(|dep| calculated.get(dep))
-                        .filter_map(|dep| dep.end_date)
-                        .max();
-                    updated.start_date = Some(max_dep_end
-                        .map_or(project.project_start_date, |d| d + Duration::days(1)));
-                } else if let Some(manual) = task.manual_start_date {
-                    updated.start_date = Some(manual);
-                } else {
-                    updated.start_date = Some(project.project_start_date);
-                }
-                updated.end_date = updated.start_date.map(|d| d + Duration::days(updated.duration.max(1) - 1));
-                calculated.insert(*task_id, updated);
-                false
-            } else {
-                true
-            }
-        });
-        iterations += 1;
+fn task_end(start: NaiveDate, duration: i64) -> Option<NaiveDate> {
+    if duration < 1 { return None; }
+    add_days(start, duration.checked_sub(1)?)
+}
+
+fn parse_date_input(value: &str) -> Option<NaiveDate> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("today") { return Some(Local::now().date_naive()); }
+    let year = value.rsplit('/').next()?;
+    let format = if year.len() == 2 { "%m/%d/%y" } else { "%m/%d/%Y" };
+    NaiveDate::parse_from_str(value, format).ok()
+}
+
+fn parse_duration_input(value: &str, start: NaiveDate) -> Option<i64> {
+    let value = value.trim();
+    let (number, factor) = match value.as_bytes().last() {
+        Some(b'w') => (&value[..value.len()-1], 7),
+        Some(b'm') => (&value[..value.len()-1], 30),
+        Some(b'y') => (&value[..value.len()-1], 365),
+        _ => (value, 1),
+    };
+    let days = number.parse::<i64>().ok()?.checked_mul(factor)?;
+    task_end(start, days)?;
+    Some(days)
+}
+
+fn parse_progress_input(value: &str) -> Option<u8> {
+    value.trim().parse::<u64>().ok().map(|n| n.min(100) as u8)
+}
+
+fn alphabetic_id(mut index: usize) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push((b'a' + (index % 26) as u8) as char);
+        if index < 26 { break; }
+        index = index / 26 - 1;
     }
+    letters.into_iter().rev().collect()
+}
 
-    for task in &mut project.tasks {
-        if let Some(c) = calculated.get(&task.id) {
-            task.start_date = c.start_date;
-            task.end_date = c.end_date;
-        } else {
-            task.start_date = None;
-            task.end_date = None;
-        }
+fn renumber_tasks(project: &mut ProjectData) {
+    let ids: HashMap<u32, u32> = project.tasks.iter().enumerate()
+        .map(|(index, task)| (task.id, (index + 1) as u32)).collect();
+    for (index, task) in project.tasks.iter_mut().enumerate() {
+        task.id = (index + 1) as u32;
+        task.parent_id = task.parent_id.and_then(|id| ids.get(&id).copied());
+        task.dependencies = task.dependencies.iter().filter_map(|id| ids.get(id).copied()).collect();
     }
+}
 
-    // Second pass: parent spans its children
-    let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
+fn reorder_task_tree(project: &mut ProjectData) {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut roots = Vec::new();
     for task in &project.tasks {
-        if let Some(pid) = task.parent_id {
-            children_map.entry(pid).or_default().push(task.id);
-        }
+        if let Some(parent) = task.parent_id { children.entry(parent).or_default().push(task.id); }
+        else { roots.push(task.id); }
     }
-
-    fn get_depth(task_id: u32, tasks: &[Task]) -> usize {
-        match tasks.iter().find(|t| t.id == task_id).and_then(|t| t.parent_id) {
-            Some(pid) => 1 + get_depth(pid, tasks),
-            None => 0,
-        }
-    }
-
-    let mut parent_ids: Vec<u32> = children_map.keys().copied().collect();
-    parent_ids.sort_by(|a, b| {
-        get_depth(*b, &project.tasks).cmp(&get_depth(*a, &project.tasks))
-    });
-
-    for pid in parent_ids {
-        if let Some(child_ids) = children_map.get(&pid) {
-            let starts: Vec<NaiveDate> = child_ids.iter()
-                .filter_map(|id| project.tasks.iter().find(|t| t.id == *id))
-                .filter_map(|t| t.start_date)
-                .collect();
-            let ends: Vec<NaiveDate> = child_ids.iter()
-                .filter_map(|id| project.tasks.iter().find(|t| t.id == *id))
-                .filter_map(|t| t.end_date)
-                .collect();
-            if !starts.is_empty() && !ends.is_empty() {
-                let min_start = starts.into_iter().min().unwrap();
-                let max_end = ends.into_iter().max().unwrap();
-                if let Some(parent) = project.tasks.iter_mut().find(|t| t.id == pid) {
-                    parent.start_date = Some(min_start);
-                    parent.end_date = Some(max_end);
-                }
-            }
+    let mut tasks: HashMap<u32, Task> = std::mem::take(&mut project.tasks).into_iter().map(|t| (t.id, t)).collect();
+    let mut pending: Vec<u32> = roots.into_iter().rev().collect();
+    while let Some(id) = pending.pop() {
+        if let Some(task) = tasks.remove(&id) {
+            project.tasks.push(task);
+            if let Some(ids) = children.get(&id) { pending.extend(ids.iter().rev().copied()); }
         }
     }
 }
 
-// --- MAIN ---
+fn validate_loaded_data(data: &mut AllProjectsData) -> io::Result<()> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    if data.projects.is_empty() { return Err(invalid("The data file contains no projects.")); }
+    if data.active_project_index >= data.projects.len() { return Err(invalid("The active project index is out of bounds.")); }
+    for project in &mut data.projects {
+        let mut tasks = HashMap::new();
+        for task in &project.tasks {
+            if tasks.insert(task.id, task).is_some() { return Err(invalid("Duplicate task IDs in the data file.")); }
+            if task_end(task.manual_start_date.unwrap_or(project.project_start_date), task.duration).is_none() {
+                return Err(invalid("A task duration is invalid or exceeds the supported date range."));
+            }
+        }
+        for task in &project.tasks {
+            if task.dependencies.iter().any(|id| !tasks.contains_key(id)) { return Err(invalid("A task refers to a missing dependency.")); }
+            let mut seen = HashSet::new();
+            let mut parent = task.parent_id;
+            seen.insert(task.id);
+            while let Some(id) = parent {
+                if !seen.insert(id) { return Err(invalid("A task hierarchy contains a parent cycle.")); }
+                parent = tasks.get(&id).ok_or_else(|| invalid("A task refers to a missing parent."))?.parent_id;
+            }
+        }
+        for task in &mut project.tasks { task.progress = task.progress.min(100); }
+        reorder_task_tree(project);
+        renumber_tasks(project);
+    }
+    Ok(())
+}
+
+// A parent cannot finish until its children finish. Treat those edges like
+// dependency edges so downstream tasks use the final, expanded parent dates.
+fn compute_dates_for_project(project: &mut ProjectData) -> bool {
+    let count = project.tasks.len();
+    let indices: HashMap<u32, usize> = project.tasks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+    let mut children = vec![Vec::new(); count];
+    for (index, task) in project.tasks.iter().enumerate() {
+        if let Some(parent) = task.parent_id.and_then(|id| indices.get(&id)) { children[*parent].push(index); }
+    }
+    let mut dependants = vec![Vec::new(); count];
+    let mut pending_count = vec![0; count];
+    for (index, task) in project.tasks.iter().enumerate() {
+        let mut prerequisites: HashSet<usize> = task.dependencies.iter().filter_map(|id| indices.get(id).copied()).collect();
+        prerequisites.extend(children[index].iter().copied());
+        pending_count[index] = prerequisites.len();
+        for prerequisite in prerequisites { dependants[prerequisite].push(index); }
+    }
+    for task in &mut project.tasks { task.start_date = None; task.end_date = None; }
+    let mut ready: VecDeque<usize> = pending_count.iter().enumerate()
+        .filter_map(|(i, n)| if *n == 0 { Some(i) } else { None }).collect();
+    while let Some(index) = ready.pop_front() {
+        let task = &project.tasks[index];
+        let dates = if !children[index].is_empty() {
+            let child_dates: Option<Vec<_>> = children[index].iter().map(|i| {
+                let child = &project.tasks[*i];
+                Some((child.start_date?, child.end_date?))
+            }).collect();
+            child_dates.and_then(|dates| Some((dates.iter().map(|d| d.0).min()?, dates.iter().map(|d| d.1).max()?)))
+        } else {
+            let start = if task.dependencies.is_empty() {
+                Some(task.manual_start_date.unwrap_or(project.project_start_date))
+            } else {
+                let ends: Option<Vec<_>> = task.dependencies.iter().map(|id| {
+                    project.tasks[*indices.get(id)?].end_date
+                }).collect();
+                ends.and_then(|ends| ends.into_iter().max()).and_then(|end| add_days(end, 1))
+            };
+            start.and_then(|start| Some((start, task_end(start, task.duration)?)))
+        };
+        if let Some((start, end)) = dates {
+            let task = &mut project.tasks[index];
+            task.start_date = Some(start);
+            task.end_date = Some(end);
+            if !children[index].is_empty() { task.duration = (end - start).num_days() + 1; }
+        }
+        for dependant in &dependants[index] {
+            pending_count[*dependant] -= 1;
+            if pending_count[*dependant] == 0 { ready.push_back(*dependant); }
+        }
+    }
+    project.tasks.iter().all(|task| task.start_date.is_some() && task.end_date.is_some())
+}
+
 fn main() -> io::Result<()> {
+    let mut app = App::new()?;
     setup_terminal()?;
-    let mut app = App::new();
     let result = run_app(&mut app);
     restore_terminal()?;
     result
@@ -1304,6 +1376,7 @@ fn dispatch_event(app: &mut App, ev: Event) {
                 InputMode::Normal => handle_normal_mode(app, key),
                 InputMode::Editing => handle_editing_mode(app, key),
             }
+            app.normalize_selection();
         }
     }
 }
@@ -1338,6 +1411,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 if app.column_config_selected > 0 { app.column_config_selected -= 1; }
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
+                app.save_state_for_undo();
                 let vis = &mut app.all_projects.column_visibility;
                 match app.column_config_selected {
                     0 => vis.assigned_to = !vis.assigned_to,
@@ -1374,11 +1448,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
     if key.modifiers == KeyModifiers::CONTROL {
         match key.code {
             KeyCode::Char('s') => {
-                if !app.save_conflict_pending && app.file_was_modified_externally() {
-                    app.save_conflict_pending = true;
-                    app.status_message = "File was modified by another instance! Press Ctrl+s again to overwrite, or any other key to cancel.".to_string();
-                } else {
-                    app.save_all_projects().unwrap_or_else(|_| app.status_message = "Failed to save projects.".into());
+                match app.save_projects(app.save_conflict_pending) {
+                    Ok(()) => {},
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        app.save_conflict_pending = true;
+                        app.status_message = format!("{} Press Ctrl+s again to overwrite, or any other key to cancel.", error);
+                    }
+                    Err(error) => {
+                        app.save_conflict_pending = false;
+                        app.status_message = format!("Failed to save projects: {}", error);
+                    }
                 }
             },
             KeyCode::Char('r') => app.redo(),
@@ -1396,6 +1475,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Char('p') => app.move_project_backward(),
             KeyCode::Char('f') => app.push_todo_to_phone(),
             KeyCode::Char('b') => {
+                app.save_state_for_undo();
                 app.all_projects.show_archived = !app.all_projects.show_archived;
                 app.is_dirty = true;
                 app.status_message = if app.all_projects.show_archived {
@@ -1585,6 +1665,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('D') => app.delete_selected_task(),
         KeyCode::Char('u') => app.undo(),
         KeyCode::Char('t') => {
+            app.save_state_for_undo();
             let today_date = app.today; // Capture app.today before mutable borrow
             let current_project = app.get_current_project_mut();
             let days_from_start = (today_date - current_project.project_start_date).num_days();
@@ -1592,11 +1673,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.status_message = format!("Jumped to today's date.");
         }
         KeyCode::Char('H') => {
-            app.get_current_project_mut().day_offset -= 1;
+            app.save_state_for_undo();
+            app.get_current_project_mut().day_offset = app.get_current_project().day_offset.saturating_sub(1);
             app.status_message = "Moved calendar left by 1 day.".to_string();
         }
         KeyCode::Char('L') => {
-            app.get_current_project_mut().day_offset += 1;
+            app.save_state_for_undo();
+            app.get_current_project_mut().day_offset = app.get_current_project().day_offset.saturating_add(1);
             app.status_message = "Moved calendar right by 1 day.".to_string();
         }
         KeyCode::Char('T') => app.toggle_todo_list(),
@@ -1638,6 +1721,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             };
         },
         KeyCode::Char('Z') => {
+            app.save_state_for_undo();
             app.all_projects.compact_timeline = !app.all_projects.compact_timeline;
             app.is_dirty = true;
             app.status_message = if app.all_projects.compact_timeline {
@@ -1685,6 +1769,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                             }
                         }
                     } else if app.todo_list_state.selected().is_some() {
+                        app.editing_todo_name = true;
+                        app.editing_subtask = false;
                         app.input_mode = InputMode::Editing;
                         load_buffer_for_editing(app);
                     }
@@ -1962,8 +2048,8 @@ fn load_buffer_for_editing(app: &mut App) {
     let current_project = app.get_current_project();
     match app.focus_area {
         FocusArea::Project(ProjectField::Name) => app.input_buffer = current_project.project_name.clone(),
-        FocusArea::Project(ProjectField::StartDate) => app.input_buffer = current_project.project_start_date.format("%m/%d/%y").to_string(),
-        FocusArea::Project(ProjectField::EndDate) => app.input_buffer = current_project.project_end_date.map_or_else(|| "".to_string(), |d| d.format("%m/%d/%y").to_string()),
+        FocusArea::Project(ProjectField::StartDate) => app.input_buffer = current_project.project_start_date.format("%m/%d/%Y").to_string(),
+        FocusArea::Project(ProjectField::EndDate) => app.input_buffer = current_project.project_end_date.map_or_else(|| "".to_string(), |d| d.format("%m/%d/%Y").to_string()),
         FocusArea::Tasks => {
             if let Some(index) = app.table_state.selected() {
                 let task = &current_project.tasks[index];
@@ -1979,8 +2065,8 @@ fn load_buffer_for_editing(app: &mut App) {
                             .collect::<Vec<_>>()
                             .join(", ")
                     },
-                    TaskField::EndDate => task.end_date.map_or("".to_string(), |d| d.format("%m/%d/%y").to_string()),
-                    TaskField::StartDate => task.manual_start_date.map_or("".to_string(), |d| d.format("%m/%d/%y").to_string()),
+                    TaskField::EndDate => task.end_date.map_or("".to_string(), |d| d.format("%m/%d/%Y").to_string()),
+                    TaskField::StartDate => task.manual_start_date.map_or("".to_string(), |d| d.format("%m/%d/%Y").to_string()),
                 };
             }
         }
@@ -2016,10 +2102,7 @@ fn save_buffer_to_task(app: &mut App) {
             match field {
                 ProjectField::Name => current_project.project_name = input_buffer_owned.clone(),
                 ProjectField::StartDate => {
-                    if input_buffer_owned.to_lowercase() == "today" {
-                        current_project.project_start_date = Local::now().date_naive();
-                    }
-                    else if let Ok(date) = NaiveDate::parse_from_str(&input_buffer_owned, "%m/%d/%y") {
+                    if let Some(date) = parse_date_input(&input_buffer_owned) {
                         current_project.project_start_date = date;
                     } else {
                         app.status_message = "Invalid date format. Please use mm/dd/yyyy or 'today'.".to_string();
@@ -2028,9 +2111,7 @@ fn save_buffer_to_task(app: &mut App) {
                 ProjectField::EndDate => {
                     if input_buffer_owned.is_empty() {
                         current_project.project_end_date = None;
-                    } else if input_buffer_owned.to_lowercase() == "today" {
-                        current_project.project_end_date = Some(Local::now().date_naive());
-                    } else if let Ok(date) = NaiveDate::parse_from_str(&input_buffer_owned, "%m/%d/%y") {
+                    } else if let Some(date) = parse_date_input(&input_buffer_owned) {
                         current_project.project_end_date = Some(date);
                     } else {
                         app.status_message = "Invalid date format. Please use mm/dd/yyyy or 'today'.".to_string();
@@ -2043,7 +2124,7 @@ fn save_buffer_to_task(app: &mut App) {
                 if selected_task_field == TaskField::Dependencies {
                     let display_ids = app.generate_task_display_ids();
                     let reverse_id_map: HashMap<String, u32> = display_ids.iter().map(|(id, display)| (display.clone(), *id)).collect();
-                    let tasks_clone = app.get_current_project().tasks.clone(); // Use a clone for validation
+                    let task_ids: HashSet<u32> = app.get_current_project().tasks.iter().map(|task| task.id).collect();
 
                     let mut invalid_entries: Vec<String> = Vec::new();
                     let new_deps: Vec<u32> = input_buffer_owned.split(',')
@@ -2054,7 +2135,7 @@ fn save_buffer_to_task(app: &mut App) {
                                 return Some(*id);
                             }
                             if let Ok(id) = trimmed.parse::<u32>() {
-                                if tasks_clone.iter().any(|t| t.id == id) {
+                                if task_ids.contains(&id) {
                                     return Some(id);
                                 }
                             }
@@ -2073,14 +2154,10 @@ fn save_buffer_to_task(app: &mut App) {
                     }
                 } else if selected_task_field == TaskField::EndDate {
                     let start_date = app.get_current_project().tasks[index].start_date;
-                    let new_end = if input_buffer_owned.to_lowercase() == "today" {
-                        Some(Local::now().date_naive())
-                    } else if let Ok(d) = NaiveDate::parse_from_str(&input_buffer_owned, "%m/%d/%y") {
-                        Some(d)
-                    } else {
+                    let new_end = parse_date_input(&input_buffer_owned);
+                    if new_end.is_none() {
                         app.status_message = "Invalid date format. Please use mm/dd/yyyy or 'today'.".to_string();
-                        None
-                    };
+                    }
                     if let Some(end) = new_end {
                         if let Some(start) = start_date {
                             let new_duration = (end - start).num_days() + 1;
@@ -2094,40 +2171,24 @@ fn save_buffer_to_task(app: &mut App) {
                         }
                     }
                 } else {
+                    let task_start = app.get_current_project().tasks[index].start_date.unwrap_or(app.get_current_project().project_start_date);
                     let task = &mut app.get_current_project_mut().tasks[index];
                     match selected_task_field {
                         TaskField::Name => task.name = input_buffer_owned.clone(),
                         TaskField::AssignedTo => task.assigned_to = input_buffer_owned.clone(),
                         TaskField::Duration => {
-                            let mut duration = task.duration;
-                            let trimmed = input_buffer_owned.trim();
-                            if trimmed.ends_with('w') {
-                                if let Ok(val) = trimmed[..trimmed.len()-1].parse::<i64>() {
-                                    duration = val * 7;
-                                }
-                            } else if trimmed.ends_with('m') {
-                                if let Ok(val) = trimmed[..trimmed.len()-1].parse::<i64>() {
-                                    duration = val * 30;
-                                }
-                            } else if trimmed.ends_with('y') {
-                                if let Ok(val) = trimmed[..trimmed.len()-1].parse::<i64>() {
-                                    duration = val * 365;
-                                }
-                            } else if let Ok(val) = trimmed.parse::<i64>() {
-                                duration = val;
-                            }
-                            task.duration = duration;
+                            if let Some(duration) = parse_duration_input(&input_buffer_owned, task_start) { task.duration = duration; }
+                            else { app.status_message = "Invalid duration: enter a positive number within the supported date range, optionally followed by w/m/y.".to_string(); }
                         },
-                        TaskField::Progress => task.progress = input_buffer_owned.parse().unwrap_or(task.progress).min(100),
+                        TaskField::Progress => {
+                            if let Some(progress) = parse_progress_input(&input_buffer_owned) { task.progress = progress; }
+                            else { app.status_message = "Invalid progress: enter a non-negative number.".to_string(); }
+                        },
                         TaskField::StartDate => {
                             if input_buffer_owned.is_empty() {
                                 task.manual_start_date = None;
                             } else {
-                                let new_start = if input_buffer_owned.to_lowercase() == "today" {
-                                    Some(Local::now().date_naive())
-                                } else {
-                                    NaiveDate::parse_from_str(&input_buffer_owned, "%m/%d/%y").ok()
-                                };
+                                let new_start = parse_date_input(&input_buffer_owned);
                                 if let Some(new_start) = new_start {
                                     // Keep existing duration; end date is recalculated from start + duration
                                     task.manual_start_date = Some(new_start);
@@ -2492,12 +2553,12 @@ fn render_task_table(frame: &mut Frame, area: Rect, app: &mut App, column_widths
     let end_date_style = if app.focus_area == FocusArea::Project(ProjectField::EndDate) { Style::default().bg(Color::Blue) } else { Style::default() };
 
     let name_text = if app.focus_area == FocusArea::Project(ProjectField::Name) && app.input_mode == InputMode::Editing { &app.input_buffer } else { &current_project.project_name };
-    let start_date_text = if app.focus_area == FocusArea::Project(ProjectField::StartDate) && app.input_mode == InputMode::Editing { app.input_buffer.clone() } else { current_project.project_start_date.format("%m/%d/%y").to_string() };
+    let start_date_text = if app.focus_area == FocusArea::Project(ProjectField::StartDate) && app.input_mode == InputMode::Editing { app.input_buffer.clone() } else { current_project.project_start_date.format("%m/%d/%Y").to_string() };
 
     let end_date_text = if app.focus_area == FocusArea::Project(ProjectField::EndDate) && app.input_mode == InputMode::Editing {
         app.input_buffer.clone()
     } else {
-        current_project.project_end_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%y").to_string())
+        current_project.project_end_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%Y").to_string())
     };
 
     let archived_count = app.all_projects.projects.iter().filter(|p| p.archived).count();
@@ -2627,8 +2688,8 @@ fn render_task_table(frame: &mut Frame, area: Rect, app: &mut App, column_widths
         let cells_data = vec![
             (TaskField::Name, name_display),
             (TaskField::AssignedTo, task.assigned_to.clone()),
-            (TaskField::StartDate, task.start_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%y").to_string())),
-            (TaskField::EndDate, task.end_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%y").to_string())),
+            (TaskField::StartDate, task.start_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%Y").to_string())),
+            (TaskField::EndDate, task.end_date.map_or_else(|| "-".to_string(), |d| d.format("%m/%d/%Y").to_string())),
             (TaskField::Duration, task.duration.to_string()),
             (TaskField::Progress, task.progress.to_string()),
             (TaskField::Dependencies, deps_str),
@@ -2685,7 +2746,7 @@ fn render_gantt_chart(frame: &mut Frame, area: Rect, app: &mut App) {
     
     app.gantt_area_width = content_area.width;
     let current_project = app.get_current_project();
-    let min_date = current_project.project_start_date + Duration::days(current_project.day_offset);
+    let min_date = add_days(current_project.project_start_date, current_project.day_offset).unwrap_or(current_project.project_start_date);
     
     let day_width: u16 = if app.all_projects.compact_timeline { 1 } else { 3 };
     let date_range_days = (app.gantt_area_width / day_width) as i64;
@@ -2698,7 +2759,7 @@ fn render_gantt_chart(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut compact_month_char_idx = 0usize;
 
     for day in 0..=date_range_days {
-        let current_date = min_date + Duration::days(day);
+        let Some(current_date) = add_days(min_date, day) else { break; };
         let is_today = current_date == app.today;
         let is_deadline_day = app.get_current_project().project_end_date == Some(current_date);
 
@@ -2801,13 +2862,13 @@ fn render_gantt_chart(frame: &mut Frame, area: Rect, app: &mut App) {
         if let (Some(start), Some(end)) = (task.start_date, task.end_date) {
             let progress_duration = (task.duration as f32 * (task.progress as f32 / 100.0)).round() as i64;
             let progress_end = if progress_duration > 0 {
-                start + Duration::days(progress_duration - 1)
+                add_days(start, progress_duration - 1)
             } else {
-                start - Duration::days(1)
+                None
             };
 
             for day in 0..=date_range_days {
-                let current_date = min_date + Duration::days(day);
+                let Some(current_date) = add_days(min_date, day) else { break; };
                 let is_today = current_date == app.today;
                 let is_deadline_day = app.get_current_project().project_end_date == Some(current_date);
                 let is_task_day = current_date >= start && current_date <= end;
@@ -2819,7 +2880,7 @@ fn render_gantt_chart(frame: &mut Frame, area: Rect, app: &mut App) {
                             else if current_date == end { "]" }
                             else { "=" }
                         } else {
-                            let is_progress_day = current_date <= progress_end;
+                            let is_progress_day = progress_end.map_or(false, |end| current_date <= end);
                             if is_today { "|" }
                             else if is_progress_day { "░" }
                             else { "█" }
@@ -2839,7 +2900,7 @@ fn render_gantt_chart(frame: &mut Frame, area: Rect, app: &mut App) {
                             "==="
                         }
                     } else {
-                        let is_progress_day = current_date <= progress_end;
+                        let is_progress_day = progress_end.map_or(false, |end| current_date <= end);
                         if is_today {
                             if is_progress_day { "|░░" } else { "|██" }
                         } else {
@@ -3040,3 +3101,6 @@ fn restore_terminal() -> io::Result<()> {
     disable_raw_mode()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
